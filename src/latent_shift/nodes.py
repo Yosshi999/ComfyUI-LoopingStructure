@@ -1,13 +1,33 @@
 from inspect import cleandoc
 from comfy_api.latest import io
+import torch
 
 class LatentShiftImpl:
     def __init__(self, shift_step, shift_axis):
         self.shift_step = shift_step
         self.shift_axis = shift_axis
         self.call_count = 0
-    def __call__(self, q, k, v, extra_options, **kwargs):
-        return {"q": q, "k": k, "v": v}
+    def __call__(self, data: dict):
+        self.call_count += 1
+        print("LatentShift called, call count:", self.call_count)
+        # retrieve linspace parameters
+        # TODO: distribution of specified direction
+        target_direction = 2
+        samples = data["img_ids"][:, :, target_direction]
+        distr = torch.unique(samples, dim=1)  # (batch_size, num_unique == steps_w)
+        start = samples.min(1).values  # (batch_size,)
+        end = samples.max(1).values  # (batch_size,)
+        steps = distr.shape[1]
+        stepsize = (end - start) / (steps - 1)
+        # calculate shift amount
+        shift_amount = self.shift_step * stepsize * self.call_count  # (batch_size,)
+        shifted_samples = torch.fmod(samples + (shift_amount - start)[:, None], (end - start + stepsize)[:, None]) + start[:, None]
+        new_img_ids = data["img_ids"].clone()
+        new_img_ids[:, :, target_direction] = shifted_samples
+        new_data = data.copy()
+        new_data["img_ids"] = new_img_ids
+        print("LatentShift executed:", data["img_ids"][0,0,:], "->", new_data["img_ids"][0,0,:])
+        return new_data
     def cleanup(self):
         self.call_count = 0
 
@@ -40,7 +60,8 @@ class LatentShift:
 
     def execute(self, model: io.Model.Type, shift_step: int, shift_axis: str):
         model = model.clone()
-
+        patch_obj = LatentShiftImpl(shift_step, shift_axis)
+        model.set_model_post_input_patch(patch_obj)
         return (model,)
 
 
