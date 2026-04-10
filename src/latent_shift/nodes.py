@@ -64,14 +64,82 @@ class LatentShift:
         model.set_model_post_input_patch(patch_obj)
         return (model,)
 
+class VAEDecodeCircular:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "samples": ("LATENT", {"tooltip": "The latent to be decoded."}),
+                "vae": ("VAE", {"tooltip": "The VAE model used for decoding the latent."}),
+                "overlap_x": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "The amount of overlap in pixels for the x-axis when generating a looped structure."}),
+                "overlap_y": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "The amount of overlap in pixels for the y-axis when generating a looped structure."}),
+                "overlap_t": ("INT", {"default": 8, "min": 0, "max": 4096, "step": 4, "tooltip": "The amount of overlap in pixels for the temporal-axis when generating a looped structure."}),
+            }
+        }
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_TOOLTIPS = ("The decoded image.",)
+    FUNCTION = "decode"
+
+    CATEGORY = "latent"
+    DESCRIPTION = "Decodes latent images back into pixel space images."
+    SEARCH_ALIASES = ["decode", "decode latent", "latent to image", "render latent"]
+
+    def decode(self, vae: io.Vae.Type, samples: io.Latent.Type, overlap_x: int = 64, overlap_y: int = 64, overlap_t: int = 8):
+        temporal_compression = vae.temporal_compression_decode()
+        if temporal_compression is not None:
+            latent_overlap_t = max(0, overlap_t // temporal_compression)
+        else:
+            latent_overlap_t = 0
+        compression = vae.spacial_compression_decode()
+        latent_overlap_x = max(0, overlap_x // compression)
+        latent_overlap_y = max(0, overlap_y // compression)
+        latent = samples["samples"]
+        if latent.is_nested:
+            latent = latent.unbind()[0]
+        # latent shape: (batch_size, channels, T?, H?, W)
+        dims = latent.ndim - 2
+        if dims == 1:
+            pads = [latent_overlap_x]
+            pads_px = [overlap_x]
+        elif dims == 2:
+            pads = [latent_overlap_y, latent_overlap_x]
+            pads_px = [overlap_y, overlap_x]
+        elif dims == 3:
+            pads = [latent_overlap_t, latent_overlap_y, latent_overlap_x]
+            pads_px = [overlap_t, overlap_y, overlap_x]
+        else:
+            pads = []
+            pads_px = []
+        for i, pad in enumerate(pads):
+            if pad <= 0:
+                continue
+            dim_size = latent.shape[2 + i]
+            left_glue = latent.narrow(2 + i, dim_size - pad, pad)
+            right_glue = latent.narrow(2 + i, 0, pad)
+            latent = torch.cat([left_glue, latent, right_glue], dim=2+i)
+
+        images = vae.decode(latent)
+        if len(images.shape) == 5: #Combine batches
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        
+        print("image shape:", images.shape)
+        # remove pads
+        for i, pad in enumerate(pads_px):
+            if pad <= 0:
+                continue
+            dim_size = images.shape[1 + i]
+            images = images.narrow(1 + i, pad, dim_size - 2 * pad)
+        return (images, )
 
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
-    "LatentShift": LatentShift
+    "LatentShift": LatentShift,
+    "VAEDecodeCircular": VAEDecodeCircular,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LatentShift": "Latent Shift Node"
+    "LatentShift": "Latent Shift Node",
+    "VAEDecodeCircular": "VAE Decode Circular Node"
 }
