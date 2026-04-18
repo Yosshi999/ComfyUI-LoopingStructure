@@ -176,7 +176,7 @@ class GluedAttentionImpl:
             img_ids = torch.cat([img_ids, clone_img_ids], dim=1)
         out = data.copy()
         out["img_ids"] = img_ids
-        mask_modifier = torch.ones((1, txt_len + img_len, txt_len + img_ids.shape[1]), device=img_ids.device, dtype=torch.bool)
+        mask_modifier = torch.ones((img_ids.shape[0], txt_len + img_len, txt_len + img_ids.shape[1]), device=img_ids.device, dtype=torch.bool)
         mask_modifier[:, :txt_len, txt_len + img_len:] = False  # prevent text tokens from attending to the glued image tokens
         # apply distance constraint
         for loop, target_direction, (left_bound, right_bound) in zip([self.loop_x, self.loop_y], [2, 1], valid_segment):
@@ -184,7 +184,7 @@ class GluedAttentionImpl:
                 continue
             img_ids_axis = img_ids[:, :, target_direction]
             diff = img_ids_axis[:, None, :] - img_ids_axis[:, :img_len, None]
-            mask_modifier[:, txt_len:, txt_len:] &= (left_bound <= diff) & (diff <= right_bound)
+            mask_modifier[:, txt_len:, txt_len:] &= (left_bound[:, None, None] <= diff) & (diff <= right_bound[:, None, None])
         self.mask_modifier = mask_modifier
         return out
     
