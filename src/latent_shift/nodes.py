@@ -256,6 +256,130 @@ class GluedAttention:
         return (model,)
 
 
+class PartialGluedAttentionImpl:
+    def __init__(self, loop_x: bool, start_x: int, end_x: int, loop_y: bool, start_y: int, end_y: int):
+        self.loop_x = loop_x
+        self.start_x = start_x
+        self.end_x = end_x
+        self.loop_y = loop_y
+        self.start_y = start_y
+        self.end_y = end_y
+
+    def replicate_rope(self, data: dict):
+        img_ids: Tensor = data["img_ids"]  # (batch_size, num_tokens, axes_dim)
+        img_len = img_ids.shape[1]
+        txt_len: int = data["txt_ids"].shape[1]
+        valid_segment: List[Tuple[int, int]] = []  # valid distance of ids
+        self.all_clone_indices = []
+        for loop, loop_start, loop_end, target_direction in [(self.loop_x, self.start_x, self.end_x, 2), (self.loop_y, self.start_y, self.end_y, 1)]:
+            start, end, steps = retrieve_linspace_parameters(img_ids[:, :, target_direction])
+            print(img_ids.shape, start, end, steps)
+            width = end - start
+            if not loop:
+                valid_segment.append((-width, width))  # full attention
+                self.all_clone_indices.append(None)
+                continue
+            stepsize = (end - start) / (steps - 1)
+            loop_start_ids = start + stepsize * loop_start
+            loop_end_ids = end - stepsize * loop_end
+            center_ids = (loop_start_ids + loop_end_ids) / 2
+            loop_width = loop_end_ids - loop_start_ids + stepsize
+            mask_start = img_ids[:, :, target_direction] >= loop_start_ids[:, None]
+            mask_end = img_ids[:, :, target_direction] <= loop_end_ids[:, None]
+            print(mask_start.shape, mask_end.shape)
+            clone_indices = torch.where((mask_start & mask_end)[0,:])[0]  # (num_tokens,)
+            clone_img_ids = img_ids.clone()[:, clone_indices, :]
+            clone_img_ids[:, :, target_direction] = torch.where(
+                clone_img_ids[:, :, target_direction] <= center_ids[:, None],
+                clone_img_ids[:, :, target_direction] + loop_width[:, None],
+                clone_img_ids[:, :, target_direction] - loop_width[:, None]
+            )
+            valid_segment.append((-width//4, width//4))  # only allow attention within half loop TODO: boundary case
+            # update img_ids
+            img_ids = torch.cat([img_ids, clone_img_ids], dim=1)
+            self.all_clone_indices.append(clone_indices)
+        out = data.copy()
+        out["img_ids"] = img_ids
+        mask_modifier = torch.ones((img_ids.shape[0], txt_len + img_len, txt_len + img_ids.shape[1]), device=img_ids.device, dtype=torch.bool)
+        mask_modifier[:, :txt_len, txt_len + img_len:] = False  # prevent text tokens from attending to the glued image tokens
+        # apply distance constraint
+        for loop, target_direction, (left_bound, right_bound) in zip([self.loop_x, self.loop_y], [2, 1], valid_segment):
+            if not loop:
+                continue
+            img_ids_axis = img_ids[:, :, target_direction]
+            diff = img_ids_axis[:, None, :] - img_ids_axis[:, :img_len, None]
+            mask_modifier[:, txt_len:, txt_len:] &= (left_bound[:, None, None] <= diff) & (diff <= right_bound[:, None, None])
+        self.mask_modifier = mask_modifier
+        return out
+    
+    def attn_pre(self, q, k, v, pe=None, attn_mask=None, extra_options=None):
+        """
+        q: (batch_size, num_heads, L, dim)
+        k: (batch_size, num_heads, S, dim)
+        v: (batch_size, num_heads, S, dim)
+        """
+        block_type: Literal["single", "double"] = extra_options["block_type"]
+        img_slice: List[int] = extra_options["img_slice"]
+        """
+        Note: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+        L: query length, S: key/value length, N: batch size
+        attn_mask (optional Tensor): Attention mask; shape must be broadcastable to the shape of attention weights, which is (N,...,L,S).
+        Two types of masks are supported. A boolean mask where a value of True indicates that the element should take part in attention.
+        A float mask of the same type as query, key, value that is added to the attention score.
+        """
+        attn_mask = attn_mask.clone() if attn_mask is not None else torch.ones((1, q.shape[2], k.shape[2]), device=q.device, dtype=torch.bool)
+        assert attn_mask.shape == (1, q.shape[2], k.shape[2]), f"Expected attn_mask shape (1, {q.shape[2]}, {k.shape[2]}), got {attn_mask.shape}"
+        k_glues = []
+        v_glues = []
+        for ind, loop in zip(self.all_clone_indices, [self.loop_x, self.loop_y]):
+            if not loop:
+                continue
+            k_img = k[:, :, img_slice[0]:img_slice[1], :]
+            v_img = v[:, :, img_slice[0]:img_slice[1], :]
+            k_glues.append(k_img[:, :, ind, :])
+            v_glues.append(v_img[:, :, ind, :])
+            attn_mask = torch.cat([attn_mask, attn_mask[:, :, ind]], dim=2)
+
+        out = {
+            "q": q,
+            "k": torch.cat([k, *k_glues], dim=2),
+            "v": torch.cat([v, *v_glues], dim=2),
+            "pe": pe,
+            "attn_mask": attn_mask & self.mask_modifier,
+        }
+        return out
+
+class PartialLoopedAttention:
+    """Glued Attention for partially looped structure."""
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "The model to apply the Partial Looped Attention to."}),
+                "loop_x": ("BOOLEAN", {"default": True}),
+                "start_x": ("INT", {"default": 0, "min": 0, "max": 128, "step": 8, "tooltip": "The offset in latents for the start of x-axis looped structure."}),
+                "end_x":   ("INT", {"default": 0, "min": 0, "max": 128, "step": 8, "tooltip": "The offset in latents for the end of x-axis looped structure."}),
+                "loop_y": ("BOOLEAN", {"default": True}),
+                "start_y": ("INT", {"default": 0, "min": 0, "max": 128, "step": 8, "tooltip": "The offset in latents for the start of y-axis looped structure."}),
+                "end_y":   ("INT", {"default": 0, "min": 0, "max": 128, "step": 8, "tooltip": "The offset in latents for the end of y-axis looped structure."}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    DESCRIPTION = cleandoc(__doc__)
+    FUNCTION = "execute"
+    CATEGORY = "model_patches"
+
+    def execute(self, model: io.Model.Type, loop_x: bool, start_x: int, end_x: int, loop_y: bool, start_y: int, end_y: int):
+        model = model.clone()
+        patch_obj = PartialGluedAttentionImpl(loop_x, start_x, end_x, loop_y, start_y, end_y)
+        model.set_model_post_input_patch(patch_obj.replicate_rope)
+        model.set_model_attn1_patch(patch_obj.attn_pre)
+        return (model,)
+
 
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
@@ -263,11 +387,13 @@ NODE_CLASS_MAPPINGS = {
     "LatentShift": LatentShift,
     "VAEDecodeCircular": VAEDecodeCircular,
     "GluedAttention": GluedAttention,
+    "PartialLoopedAttention": PartialLoopedAttention,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LatentShift": "Latent Shift Node",
     "VAEDecodeCircular": "VAE Decode Circular Node",
-    "GluedAttention": "Glued Attention Node"
+    "GluedAttention": "Glued Attention Node",
+    "PartialLoopedAttention": "Partial Looped Attention Node"
 }
