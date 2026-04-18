@@ -205,23 +205,25 @@ class GluedAttentionImpl:
         """
         attn_mask = attn_mask.clone() if attn_mask is not None else torch.ones((1, q.shape[2], k.shape[2]), device=q.device, dtype=torch.bool)
         assert attn_mask.shape == (1, q.shape[2], k.shape[2]), f"Expected attn_mask shape (1, {q.shape[2]}, {k.shape[2]}), got {attn_mask.shape}"
-        k_glues = []
-        v_glues = []
+        k_txt = k[:, :, :img_slice[0], :]
+        v_txt = v[:, :, :img_slice[0], :]
+        k_img = k[:, :, img_slice[0]:img_slice[1], :]
+        v_img = v[:, :, img_slice[0]:img_slice[1], :]
+        attn_txt = attn_mask[:, :, :img_slice[0]]
+        attn_img = attn_mask[:, :, img_slice[0]:img_slice[1]]
         for loop in [self.loop_x, self.loop_y]:
             if not loop:
                 continue
-            k_img = k[:, :, img_slice[0]:img_slice[1], :]
-            v_img = v[:, :, img_slice[0]:img_slice[1], :]
-            k_glues.append(k_img)
-            v_glues.append(v_img)
-            attn_mask = torch.cat([attn_mask, attn_mask[:, :, img_slice[0]:img_slice[1]]], dim=2)
+            k_img = torch.cat([k_img, k_img], dim=2)
+            v_img = torch.cat([v_img, v_img], dim=2)
+            attn_img = torch.cat([attn_img, attn_img], dim=2)
 
         out = {
             "q": q,
-            "k": torch.cat([k, *k_glues], dim=2),
-            "v": torch.cat([v, *v_glues], dim=2),
+            "k": torch.cat([k_txt, k_img], dim=2),
+            "v": torch.cat([v_txt, v_img], dim=2),
             "pe": pe,
-            "attn_mask": attn_mask & self.mask_modifier,
+            "attn_mask": torch.cat([attn_txt, attn_img], dim=2) & self.mask_modifier,
         }
         return out
 
